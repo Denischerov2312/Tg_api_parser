@@ -1,0 +1,21 @@
+[project]
+name = "tg-api-parser"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Denischerov2312", email = "107198033+Denischerov2312@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "openai>=3.28.0",
+    "python-dotenv>=1.0",
+    "telethon>=1.36",
+]
+
+[project.scripts]
+tg-api-parser = "tg_api_parser:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"

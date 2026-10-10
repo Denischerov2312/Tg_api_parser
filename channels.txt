@@ -1,0 +1,12 @@
+# Список каналов, по одному на строку.
+# Можно писать @username, username или ссылку https://t.me/username
+# Строки, начинающиеся с #, игнорируются.
+#
+# Пример:
+# @some_it_events_channel
+# https://t.me/another_meetups_channel
+@codenrock
+@kollaboratorium
+@hackathonsrus
+@leadersofdigital
+@ctfnews
