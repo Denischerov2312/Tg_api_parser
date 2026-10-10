@@ -11,7 +11,8 @@ parser.py склеивает только очевидные дубли (оди�
   python dedup_llm.py --dry-run  только показать, что модель предлагает склеить
 
 Перед изменением events.json делается копия events.json.bak.
-Статистика запуска дописывается в logs/dedup_runs.csv.
+Статистика запуска дописывается в logs/dedup_runs.csv,
+подробный лог — в logs/runs/<дата_время>_dedup.log.
 """
 import argparse
 import asyncio
@@ -23,12 +24,12 @@ from datetime import date, datetime
 from openai import APIError
 
 from common import (
-    BASE, EVENTS_FILE, LLM_MODEL, LOGS_DIR, LLMUsage, append_stats, export_csv, is_actual,
-    llm_json, load_events, make_llm, merge_into, pct, save_events, setup_logging,
+    BASE, DEDUP_STATS_COLUMNS, DEDUP_STATS_FILE, EVENTS_FILE, LLM_MODEL, LLMUsage, append_stats,
+    export_csv, is_actual, llm_cost, llm_json, load_events, make_llm, merge_into, pct,
+    save_events, setup_logging, tag,
 )
 
 MAX_EVENTS = 150  # больше событий в одном запросе не отправляем, чтобы модель не теряла внимание
-STATS_FILE = LOGS_DIR / "dedup_runs.csv"
 
 SYSTEM_PROMPT = """\
 Тебе дан список IT-соревнований (хакатоны, олимпиады, конкурсы, CTF и т.п.), \
@@ -48,12 +49,6 @@ CTF в один день, разные сезоны или треки с отд�
 Каждая группа — минимум 2 id из списка, один id может входить только в одну группу. \
 Если дублей нет, верни {"groups": []}.
 """
-
-STATS_FIELDS = [
-    "started_at", "status", "error", "duration_s", "model", "dry_run", "events_checked",
-    "groups_returned", "groups_invalid", "llm_error_pct", "llm_requests", "llm_bad_json",
-    "prompt_tokens", "completion_tokens", "events_merged", "events_total_after",
-]
 
 
 def event_line(e: dict) -> str:
@@ -78,7 +73,7 @@ def validate_groups(data, valid_ids: set, log) -> tuple:
               and all(isinstance(i, int) and i in valid_ids for i in ids)
               and not used & set(ids))
         if not ok:
-            log.warning(f"  некорректная группа от модели, пропускаю: {g}")
+            log.warning(tag("ошибка модели", f"некорректная группа, пропускаю: {g}"))
             continue
         used |= set(ids)
         groups.append({"ids": sorted(set(ids)), "reason": str(g.get("reason", ""))})
@@ -94,11 +89,13 @@ async def run(stats, dry_run, log):
         log.warning(f"Актуальных событий {len(actual)}, проверяю ближайшие {MAX_EVENTS}")
         actual = actual[:MAX_EVENTS]
     stats["events_checked"] = len(actual)
+    stats["events_total_after"] = len(events)
     if len(actual) < 2:
         log.info("Проверять нечего: актуальных событий меньше двух.")
-        stats["events_total_after"] = len(events)
         return
 
+    log.debug("Отправленный список событий:\n" + "\n".join(
+        f"  #{e['id']} {e['start_date'] or '?'}  {e['title']}" for e in actual))
     log.info(f"Отправляю в {LLM_MODEL} список из {len(actual)} событий...")
     usage = LLMUsage()
     user_msg = f"Сегодня: {today}\n\nСобытия (по одному JSON на строку):\n" + \
@@ -111,8 +108,7 @@ async def run(stats, dry_run, log):
 
     if data is None:
         stats["llm_error_pct"] = 100.0
-        stats["events_total_after"] = len(events)
-        log.error("Модель не вернула корректный JSON, ничего не изменено.")
+        log.error(tag("ошибка модели", "модель не вернула корректный JSON, ничего не изменено"))
         return
 
     by_id = {e["id"]: e for e in events}
@@ -125,10 +121,11 @@ async def run(stats, dry_run, log):
         log.info("Модель не нашла дублей.")
     for g in groups:
         main_id, *others = g["ids"]  # основным остаётся событие, найденное раньше всех
-        log.info(f"\n#{main_id} {by_id[main_id]['title']}")
+        log.info("")
+        log.info(tag("ДУБЛИ" if not dry_run else "ДУБЛИ (пробно)", f"#{main_id} {by_id[main_id]['title']}"))
         for i in others:
-            log.info(f"  <- #{i} {by_id[i]['title']}")
-        log.info(f"  причина: {g['reason']}")
+            log.info(f"{'':<24}   <- #{i} {by_id[i]['title']}")
+        log.info(f"{'':<24} причина: {g['reason']}")
         if not dry_run:
             for i in others:
                 merge_into(by_id[main_id], by_id.pop(i))
@@ -145,35 +142,50 @@ async def run(stats, dry_run, log):
         export_csv(events, log)
 
 
+def summary(s: dict) -> str:
+    cost = f", стоимость {s['cost']}" if s["cost"] != "" else ""
+    status = "OK" if s["status"] == "ok" else f"ПРЕРВАН — {s['error']}"
+    mode = "пробный (--dry-run), ничего не изменено" if s["dry_run"] else "склейка"
+    return f"""
+==================== ИТОГ ПОИСКА ДУБЛЕЙ ====================
+Статус:               {status}
+Режим:                {mode}
+Модель:               {s['model']}
+Проверено событий:    {s['events_checked']}
+Групп дублей:         {s['groups_returned']} (некорректных: {s['groups_invalid']}, {s['llm_error_pct']}%)
+Токенов:              {s['prompt_tokens']} на вход, {s['completion_tokens']} на выход{cost}
+Склеено записей:      {s['events_merged']}
+В базе после:         {s['events_total_after']}
+Время:                {s['duration_s']} с
+Подробный лог:        {s['log_file']}
+Статистика запусков:  {DEDUP_STATS_FILE.relative_to(BASE)}  (или python stats.py)
+============================================================"""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Поиск дублей событий с помощью LLM")
     parser.add_argument("--dry-run", action="store_true", help="только показать, ничего не менять")
     args = parser.parse_args()
 
-    log = setup_logging("dedup")
+    log, log_path = setup_logging("dedup")
     started = time.monotonic()
-    stats = {f: 0 for f in STATS_FIELDS}
-    stats.update(started_at=datetime.now().isoformat(timespec="seconds"), status="ok",
-                 error="", model=LLM_MODEL, dry_run=int(args.dry_run))
-    log.debug(f"=== запуск dedup_llm.py{' --dry-run' if args.dry_run else ''} ===")
+    stats = {key: 0 for key, _ in DEDUP_STATS_COLUMNS}
+    stats.update(started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), status="ok", error="",
+                 model=LLM_MODEL, dry_run=int(args.dry_run), log_file=str(log_path.relative_to(BASE)))
+    log.debug(f"Запуск dedup_llm.py{' --dry-run' if args.dry_run else ''} {stats['started_at']}")
     try:
         asyncio.run(run(stats, args.dry_run, log))
     except APIError as e:
         stats.update(status="aborted", error=f"LLM API: {e}"[:300])
         log.error(f"Ошибка LLM API, ничего не изменено: {e}")
-    except (Exception, KeyboardInterrupt) as e:
+    except BaseException as e:  # в т.ч. Ctrl+C и SystemExit — фиксируем в статистике и пробрасываем
         stats.update(status="aborted", error=f"{type(e).__name__}: {e}"[:300])
         raise
     finally:
         stats["duration_s"] = round(time.monotonic() - started)
-        append_stats(STATS_FILE, STATS_FIELDS, stats)
-
-    log.info(
-        f"\nГотово за {stats['duration_s']} с. Проверено событий: {stats['events_checked']}, "
-        f"групп дублей: {stats['groups_returned']} (некорректных {stats['groups_invalid']}), "
-        f"склеено записей: {stats['events_merged']}.\n"
-        f"Статистика: {STATS_FILE.relative_to(BASE)}, лог: logs/dedup.log"
-    )
+        stats["cost"] = llm_cost(stats["prompt_tokens"], stats["completion_tokens"])
+        append_stats(DEDUP_STATS_FILE, DEDUP_STATS_COLUMNS, stats)
+        log.info(summary(stats))
 
 
 if __name__ == "__main__":

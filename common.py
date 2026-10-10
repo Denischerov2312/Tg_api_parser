@@ -24,15 +24,23 @@ LLM_MODEL = os.getenv("LLM_MODEL", "deepseek/deepseek-v4.1-flash")
 TITLE_SIMILARITY = float(os.getenv("TITLE_SIMILARITY", "0.85"))  # порог похожести названий для правила C
 
 EVENTS_FILE = BASE / "events.json"   # все найденные события (основное хранилище)
-OUTPUT_FILE = BASE / "events.csv"    # актуальные события для Excel, пересобирается каждый запуск
 LOGS_DIR = BASE / "logs"
+OUTPUT_FILE = BASE / "events.csv"    # актуальные события для Excel, пересобирается каждый запуск
 
 # Поля события, которые извлекает LLM
 EVENT_FIELDS = [
     "start_date", "end_date", "registration_deadline", "kind", "title", "summary",
     "format", "city", "participation", "audience", "prize", "registration_url",
 ]
-CSV_FIELDS = ["id"] + EVENT_FIELDS + ["sources_count", "sources"]
+# Колонки events.csv: (ключ события, заголовок в Excel)
+CSV_COLUMNS = [
+    ("id", "№"), ("start_date", "Начало"), ("end_date", "Конец"),
+    ("registration_deadline", "Регистрация до"), ("kind", "Тип"), ("title", "Название"),
+    ("summary", "Что делать"), ("format", "Формат"), ("city", "Город"),
+    ("participation", "Участие"), ("audience", "Для кого"), ("prize", "Призы"),
+    ("registration_url", "Ссылка на регистрацию"), ("sources_count", "Упоминаний"),
+    ("sources", "Посты"),
+]
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Слова, которые не помогают отличить одно событие от другого
@@ -44,37 +52,110 @@ GENERIC_WORDS_RE = re.compile(
 
 # ---------- логи и статистика ----------
 
-def setup_logging(name: str) -> logging.Logger:
-    """Консоль: короткие сообщения. Файл logs/<name>.log: всё подробно, с датой."""
-    LOGS_DIR.mkdir(exist_ok=True)
+RUNS_DIR = LOGS_DIR / "runs"   # отдельный подробный лог на каждый запуск
+KEEP_RUN_LOGS = 100            # сколько последних логов каждого скрипта хранить
+PARSER_STATS_FILE = LOGS_DIR / "parser_runs.csv"
+DEDUP_STATS_FILE = LOGS_DIR / "dedup_runs.csv"
+
+# Цена модели за 1 млн токенов (в валюте провайдера, у ProxyAPI — рубли). 0 = не считать стоимость
+LLM_PRICE_INPUT = float(os.getenv("LLM_PRICE_INPUT", "0"))
+LLM_PRICE_OUTPUT = float(os.getenv("LLM_PRICE_OUTPUT", "0"))
+
+# Колонки статистики: (ключ в коде, заголовок в CSV)
+PARSER_STATS_COLUMNS = [
+    ("started_at", "Дата запуска"), ("status", "Статус"), ("error", "Ошибка"),
+    ("duration_s", "Время, с"), ("model", "Модель"),
+    ("channels", "Каналов"), ("channels_failed", "Каналов с ошибкой"),
+    ("posts_read", "Прочитано постов"),
+    ("dropped_short", "Отсеяно: короткие"), ("dropped_no_keywords", "Отсеяно: нет ключевых слов"),
+    ("dropped_same_text", "Отсеяно: повтор текста"), ("dup_post_link", "Отсеяно: уже в базе"),
+    ("sent_to_llm", "Отправлено в модель"), ("llm_failed", "Ошибок модели"),
+    ("llm_error_pct", "Ошибок модели, %"), ("llm_requests", "Запросов к API"),
+    ("llm_bad_json", "Невалидных ответов"), ("prompt_tokens", "Токенов на вход"),
+    ("completion_tokens", "Токенов на выход"), ("cost", "Стоимость"),
+    ("not_competition", "Не соревнование"), ("past", "Уже прошли"),
+    ("dropped_not_online", "Не онлайн"), ("dup_url", "Дубли: ссылка на регистрацию"),
+    ("dup_title", "Дубли: название и дата"), ("new_events", "Новых событий"),
+    ("events_total", "Всего в базе"), ("events_actual", "Актуальных"), ("log_file", "Лог запуска"),
+]
+DEDUP_STATS_COLUMNS = [
+    ("started_at", "Дата запуска"), ("status", "Статус"), ("error", "Ошибка"),
+    ("duration_s", "Время, с"), ("model", "Модель"), ("dry_run", "Пробный запуск"),
+    ("events_checked", "Проверено событий"), ("groups_returned", "Групп от модели"),
+    ("groups_invalid", "Некорректных групп"), ("llm_error_pct", "Ошибок модели, %"),
+    ("llm_requests", "Запросов к API"), ("llm_bad_json", "Невалидных ответов"),
+    ("prompt_tokens", "Токенов на вход"), ("completion_tokens", "Токенов на выход"),
+    ("cost", "Стоимость"), ("events_merged", "Склеено записей"),
+    ("events_total_after", "Всего в базе после"), ("log_file", "Лог запуска"),
+]
+
+
+def setup_logging(name: str):
+    """Консоль: главное. Файл logs/runs/<дата_время>_<name>.log: всё подробно, по строке на каждый пост.
+    Возвращает (logger, путь к файлу лога)."""
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    for old in sorted(RUNS_DIR.glob(f"*_{name}.log"))[:-(KEEP_RUN_LOGS - 1)]:
+        old.unlink()
+    path = RUNS_DIR / f"{datetime.now():%Y-%m-%d_%H-%M-%S}_{name}.log"
+
     log = logging.getLogger(name)
     log.setLevel(logging.DEBUG)
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(logging.Formatter("%(message)s"))
-    file = logging.FileHandler(LOGS_DIR / f"{name}.log", encoding="utf-8")
+    file = logging.FileHandler(path, encoding="utf-8")
     file.setLevel(logging.DEBUG)
-    file.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    file.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
     log.addHandler(console)
     log.addHandler(file)
-    return log
+    return log, path
 
 
-def append_stats(path: Path, fields: list, row: dict):
-    """Дописывает строку статистики запуска. Если набор колонок поменялся,
-    старый файл переименовывается, и начинается новый."""
+def tag(label: str, text: str) -> str:
+    """Строка лога с меткой в квадратных скобках, метки выровнены в колонку."""
+    return f"{'[' + label + ']':<24} {text}"
+
+
+def snippet(text: str, length: int = 80) -> str:
+    """Начало текста поста в одну строку — чтобы в логе было видно, что это за пост."""
+    one_line = " ".join(text.replace("**", "").replace("__", "").split())
+    if not one_line:
+        return "(без текста)"
+    return one_line[:length] + ("…" if len(one_line) > length else "")
+
+
+def llm_cost(prompt_tokens: int, completion_tokens: int):
+    if not (LLM_PRICE_INPUT or LLM_PRICE_OUTPUT):
+        return ""
+    return round((prompt_tokens * LLM_PRICE_INPUT + completion_tokens * LLM_PRICE_OUTPUT) / 1_000_000, 4)
+
+
+def append_stats(path: Path, columns: list, row: dict):
+    """Дописывает строку статистики запуска (CSV с русскими заголовками для Excel).
+    Если набор колонок поменялся, старый файл переименовывается, и начинается новый."""
+    labels = [label for _, label in columns]
     LOGS_DIR.mkdir(exist_ok=True)
     if path.exists():
         with path.open(encoding="utf-8-sig") as f:
-            header = f.readline().strip().split(";")
-        if header != fields:
+            header = f.readline().rstrip("\r\n").split(";")
+        if header != labels:
             path.replace(path.with_name(f"{path.stem}_{datetime.now():%Y%m%d_%H%M%S}.csv"))
     write_header = not path.exists()
     with path.open("a", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=fields, delimiter=";", extrasaction="ignore")
+        w = csv.writer(f, delimiter=";")
         if write_header:
-            w.writeheader()
-        w.writerow(row)
+            w.writerow(labels)
+        w.writerow([row.get(key, "") for key, _ in columns])
+
+
+def read_stats(path: Path, columns: list) -> list:
+    """Читает статистику запусков, возвращает список dict с ключами из columns."""
+    if not path.exists():
+        return []
+    to_key = {label: key for key, label in columns}
+    with path.open(encoding="utf-8-sig") as f:
+        return [{to_key.get(k, k): v for k, v in row.items()}
+                for row in csv.DictReader(f, delimiter=";")]
 
 
 class LLMUsage:
@@ -235,14 +316,15 @@ def export_csv(events: list, log: logging.Logger) -> int:
     try:
         # utf-8-sig, чтобы Excel корректно открыл кириллицу
         with OUTPUT_FILE.open("w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=CSV_FIELDS, delimiter=";", extrasaction="ignore")
-            w.writeheader()
+            w = csv.writer(f, delimiter=";")
+            w.writerow([label for _, label in CSV_COLUMNS])
             for e in actual:
-                w.writerow({
+                row = {
                     **e,
                     "sources_count": len(e["sources"]),
                     "sources": " ".join(s["post_link"] for s in e["sources"]),
-                })
+                }
+                w.writerow([row.get(key, "") for key, _ in CSV_COLUMNS])
     except PermissionError:
         log.warning(f"Не удалось записать {OUTPUT_FILE.name}: закройте его в Excel и запустите снова. "
                     f"Данные сохранены в {EVENTS_FILE.name}.")

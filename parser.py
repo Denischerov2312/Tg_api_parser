@@ -11,7 +11,8 @@
   4. Прошедшие события отбрасываются. Дубли склеиваются с уже известными событиями:
      по ссылке на регистрацию (правило B) и по дате + похожему названию (правило C).
   5. Всё хранится в events.json, актуальные события выгружаются в events.csv,
-     статистика запуска дописывается в logs/parser_runs.csv.
+     статистика запуска дописывается в logs/parser_runs.csv,
+     подробности по каждому посту — в logs/runs/<дата_время>_parser.log.
 
 Запуск:  python parser.py
 """
@@ -27,9 +28,10 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError, UsernameInvalidError, UsernameNotOccupiedError
 
 from common import (
-    BASE, EVENTS_FILE, LLM_MODEL, LOGS_DIR, OUTPUT_FILE, LLMUsage, append_stats, clean_date,
-    clean_str, export_csv, find_duplicate, is_actual, known_post_links, llm_json, load_events,
-    make_llm, merge_into, next_id, pct, save_events, setup_logging,
+    BASE, LLM_MODEL, OUTPUT_FILE, PARSER_STATS_COLUMNS, PARSER_STATS_FILE, TITLE_SIMILARITY,
+    LLMUsage, append_stats, clean_date, clean_str, export_csv, find_duplicate, is_actual,
+    known_post_links, llm_cost, llm_json, load_events, make_llm, merge_into, next_id, pct,
+    save_events, setup_logging, snippet, tag,
 )
 
 API_ID = int(os.getenv("API_ID", "0"))
@@ -43,7 +45,6 @@ MAX_POST_CHARS = 4000  # длинные посты обрезаем, чтобы 
 
 CHANNELS_FILE = BASE / "channels.txt"
 STATE_FILE = BASE / "state.json"   # последний прочитанный id по каждому каналу
-STATS_FILE = LOGS_DIR / "parser_runs.csv"
 
 # Предфильтр: в посте должно быть хотя бы одно слово, связанное с соревнованиями.
 # Список намеренно широкий, точную классификацию делает LLM.
@@ -75,6 +76,7 @@ SYSTEM_PROMPT = """\
 Ответь строго одним JSON-объектом с ключами:
 {
   "is_competition": true/false,
+  "reason": "коротко, до 15 слов: почему это соревнование или нет",
   "kind": "hackathon" | "olympiad" | "contest" | "ctf" | "case" | "gamejam" | "other",
   "title": "короткое название соревнования",
   "summary": "одно предложение: что нужно делать участникам",
@@ -88,17 +90,8 @@ SYSTEM_PROMPT = """\
   "prize": "призовой фонд или призы" | null,
   "registration_url": "ссылка на регистрацию или страницу соревнования" | null
 }
-Если is_competition = false, остальные поля можно заполнить null.
+Если is_competition = false, заполни is_competition и reason, остальные поля — null.
 """
-
-STATS_FIELDS = [
-    "started_at", "status", "error", "duration_s", "model", "channels", "channels_failed",
-    "posts_read", "dropped_short", "dropped_no_keywords", "dropped_same_text", "dup_post_link",
-    "sent_to_llm", "llm_failed", "llm_error_pct", "llm_requests", "llm_bad_json",
-    "prompt_tokens", "completion_tokens",
-    "not_competition", "past", "dropped_not_online", "dup_url", "dup_title",
-    "new_events", "events_total", "events_actual",
-]
 
 
 def text_key(text: str) -> str:
@@ -132,6 +125,7 @@ async def fetch_candidates(client, channel, last_id, since, seen, known_links, s
     posts = []
     max_id_seen = last_id
     total = 0
+    log.debug(f"\n--- @{channel} (последний прочитанный id: {last_id or 'нет, первый запуск'}) ---")
     async for msg in client.iter_messages(channel, limit=LIMIT_PER_CHANNEL, min_id=last_id):
         max_id_seen = max(max_id_seen, msg.id)
         if not last_id and msg.date < since:
@@ -141,20 +135,23 @@ async def fetch_candidates(client, channel, last_id, since, seen, known_links, s
         text = (msg.text or "").strip()
         if len(text) < MIN_TEXT_LEN:
             stats["dropped_short"] += 1
+            log.debug(tag("короткий", f"{link} | {snippet(text)}"))
             continue
         if not COMPETITION_RE.search(text):
             stats["dropped_no_keywords"] += 1
+            log.debug(tag("нет ключевых слов", f"{link} | {snippet(text)}"))
             continue
         if link in known_links:  # правило A
             stats["dup_post_link"] += 1
-            log.debug(f"уже в базе: {link}")
+            log.debug(tag("уже в базе", link))
             continue
         key = text_key(text)
         if key in seen:
             stats["dropped_same_text"] += 1
-            log.debug(f"одинаковый текст: {link}")
+            log.debug(tag("повтор текста", f"{link} | {snippet(text)}"))
             continue
         seen.add(key)
+        log.debug(tag("в модель", f"{link} | {snippet(text)}"))
         posts.append({
             "channel": channel,
             "post_date": msg.date.strftime("%Y-%m-%d %H:%M"),
@@ -162,7 +159,7 @@ async def fetch_candidates(client, channel, last_id, since, seen, known_links, s
             "text": text,
         })
     stats["posts_read"] += total
-    log.info(f"@{channel}: постов {total}, в LLM пойдёт {len(posts)}")
+    log.info(f"@{channel}: постов {total}, в модель пойдёт {len(posts)}")
     return posts, max_id_seen
 
 
@@ -199,6 +196,15 @@ def to_event(data: dict, post: dict, event_id: int) -> dict:
     }
 
 
+def dates_str(e: dict) -> str:
+    parts = [e["start_date"] or "?"]
+    if e["end_date"] and e["end_date"] != e["start_date"]:
+        parts.append(f"– {e['end_date']}")
+    if e["registration_deadline"]:
+        parts.append(f"(рег. до {e['registration_deadline']})")
+    return " ".join(parts)
+
+
 async def run(stats, log):
     if not API_ID or not API_HASH:
         raise SystemExit("Заполните API_ID и API_HASH в файле .env (пример в .env.example)")
@@ -213,8 +219,15 @@ async def run(stats, log):
     since = datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)
     today = date.today().isoformat()
     stats["channels"] = len(channels)
+    log.debug(
+        f"Настройки: модель {LLM_MODEL}, DAYS_BACK={DAYS_BACK}, LIMIT_PER_CHANNEL={LIMIT_PER_CHANNEL}, "
+        f"MIN_TEXT_LEN={MIN_TEXT_LEN}, ONLY_ONLINE={int(ONLY_ONLINE)}, TITLE_SIMILARITY={TITLE_SIMILARITY}\n"
+        f"Каналы: {', '.join('@' + c for c in channels)}\n"
+        f"Событий в базе до запуска: {len(events)}"
+    )
 
     # 1. Telegram + предфильтр
+    log.debug("\n========== 1. ЧТЕНИЕ КАНАЛОВ И ПРЕДФИЛЬТР ==========")
     candidates = []
     seen = set()
     known_links = known_post_links(events)
@@ -227,14 +240,14 @@ async def run(stats, log):
                 candidates.extend(posts)
             except FloodWaitError as e:
                 stats["channels_failed"] += 1
-                log.warning(f"@{ch}: FloodWait, ждём {e.seconds} сек, канал пропущен в этом запуске")
+                log.warning(tag("ошибка канала", f"@{ch}: FloodWait, ждём {e.seconds} сек, канал пропущен"))
                 await asyncio.sleep(e.seconds + 5)
             except (UsernameInvalidError, UsernameNotOccupiedError, ValueError):
                 stats["channels_failed"] += 1
-                log.warning(f"@{ch}: канал не найден, пропускаю")
+                log.warning(tag("ошибка канала", f"@{ch}: канал не найден, пропускаю"))
             except Exception as e:  # noqa
                 stats["channels_failed"] += 1
-                log.warning(f"@{ch}: ошибка {type(e).__name__}: {e}")
+                log.warning(tag("ошибка канала", f"@{ch}: {type(e).__name__}: {e}"))
             await asyncio.sleep(2)  # пауза между каналами, чтобы не словить FloodWait
 
     # 2. LLM. Старые посты первыми, чтобы основным источником события был самый ранний анонс
@@ -250,34 +263,38 @@ async def run(stats, log):
                      prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens)
 
     # 3. Отбор и склейка дублей
+    log.debug("\n========== 2. РЕШЕНИЯ МОДЕЛИ И ДУБЛИ ==========")
     for post, data in zip(candidates, results):
         link = post["post_link"]
         if data is None:
             stats["llm_failed"] += 1
-            log.warning(f"  не удалось разобрать ответ модели: {link}")
+            log.warning(tag("ошибка модели", f"{link} — модель не вернула корректный JSON"))
             continue
+        reason = clean_str(data.get("reason"))
         event = to_event(data, post, next_id(events))
         if not data.get("is_competition"):
             stats["not_competition"] += 1
-            log.debug(f"не соревнование: {link} | {event['title']}")
+            log.debug(tag("не соревнование", f"{link} | {reason} | {snippet(post['text'], 60)}"))
             continue
         if not is_actual(event, today):
             stats["past"] += 1
-            log.debug(f"уже прошло: {link} | {event['title']}")
+            log.debug(tag("уже прошло", f"{link} | {event['title']} | {dates_str(event)}"))
             continue
         if ONLY_ONLINE and event["format"] not in ("online", "hybrid"):
             stats["dropped_not_online"] += 1
-            log.debug(f"не онлайн: {link} | {event['title']}")
+            log.debug(tag("не онлайн", f"{link} | {event['title']} | {event['format']}"))
             continue
         dup, rule = find_duplicate(events, event)
         if dup:
             stats[f"dup_{rule}"] += 1
             merge_into(dup, event)
-            log.info(f"  = дубль ({rule}) #{dup['id']} {dup['title']}  <- {link}")
+            label = "дубль: ссылка рег." if rule == "url" else "дубль: название+дата"
+            log.info(tag(label, f"#{dup['id']} {dup['title']}  <-  {event['title']} | {link}"))
             continue
         events.append(event)
         stats["new_events"] += 1
-        log.info(f"  + #{event['id']} {event['start_date'] or '????-??-??'}  {event['title']}  ({link})")
+        log.info(tag("НОВОЕ", f"#{event['id']} {event['title']} | {dates_str(event)} | {link}"))
+        log.debug(f"{'':<24} {event['kind']}, {event['format']}, {event['city'] or 'город не указан'} | {reason}")
 
     save_events(events)
     stats["events_total"] = len(events)
@@ -286,37 +303,54 @@ async def run(stats, log):
     save_state(new_state)
 
 
+def summary(s: dict) -> str:
+    cost = f", стоимость {s['cost']}" if s["cost"] != "" else ""
+    status = "OK" if s["status"] == "ok" else f"ПРЕРВАН — {s['error']}"
+    return f"""
+==================== ИТОГ ЗАПУСКА ====================
+Статус:               {status}
+Модель:               {s['model']}
+Каналов:              {s['channels']} (с ошибкой: {s['channels_failed']})
+Прочитано постов:     {s['posts_read']}
+  отсеяно до модели:  короткие {s['dropped_short']}, без ключевых слов {s['dropped_no_keywords']}, \
+повтор текста {s['dropped_same_text']}, уже в базе {s['dup_post_link']}
+Отправлено в модель:  {s['sent_to_llm']}
+  ошибок модели:      {s['llm_failed']} ({s['llm_error_pct']}%)
+  токенов:            {s['prompt_tokens']} на вход, {s['completion_tokens']} на выход{cost}
+  не соревнование:    {s['not_competition']}
+  уже прошли:         {s['past']}
+  не онлайн:          {s['dropped_not_online']}
+Дубли склеены:        по ссылке на регистрацию {s['dup_url']}, по названию и дате {s['dup_title']}
+Новых событий:        {s['new_events']}
+В базе:               {s['events_total']}, актуальных в {OUTPUT_FILE.name}: {s['events_actual']}
+Время:                {s['duration_s']} с
+Подробный лог:        {s['log_file']}
+Статистика запусков:  {PARSER_STATS_FILE.relative_to(BASE)}  (или python stats.py)
+======================================================"""
+
+
 def main():
-    log = setup_logging("parser")
+    log, log_path = setup_logging("parser")
     started = time.monotonic()
-    stats = {f: 0 for f in STATS_FIELDS}
-    stats.update(started_at=datetime.now().isoformat(timespec="seconds"),
-                 status="ok", error="", model=LLM_MODEL)
-    log.debug("=== запуск parser.py ===")
+    stats = {key: 0 for key, _ in PARSER_STATS_COLUMNS}
+    stats.update(started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), status="ok", error="",
+                 model=LLM_MODEL, log_file=str(log_path.relative_to(BASE)))
+    log.debug(f"Запуск parser.py {stats['started_at']}")
     try:
         asyncio.run(run(stats, log))
     except APIError as e:
         # state.json не сохраняем: при следующем запуске эти посты обработаются заново
         stats.update(status="aborted", error=f"LLM API: {e}"[:300])
         log.error(f"Ошибка LLM API, запуск прерван, ничего не записано: {e}")
-    except (Exception, KeyboardInterrupt) as e:
+    except BaseException as e:  # в т.ч. Ctrl+C и SystemExit — фиксируем в статистике и пробрасываем
         stats.update(status="aborted", error=f"{type(e).__name__}: {e}"[:300])
         raise
     finally:
         stats["duration_s"] = round(time.monotonic() - started)
         stats["llm_error_pct"] = pct(stats["llm_failed"], stats["sent_to_llm"])
-        append_stats(STATS_FILE, STATS_FIELDS, stats)
-
-    log.info(
-        f"\nГотово за {stats['duration_s']} с. Прочитано постов: {stats['posts_read']}, "
-        f"в LLM: {stats['sent_to_llm']}, ошибок модели: {stats['llm_failed']} ({stats['llm_error_pct']}%).\n"
-        f"Не соревнование: {stats['not_competition']}, прошли: {stats['past']}, "
-        f"дубли: ссылка на пост {stats['dup_post_link']}, одинаковый текст {stats['dropped_same_text']}, "
-        f"ссылка на регистрацию {stats['dup_url']}, название+дата {stats['dup_title']}.\n"
-        f"Новых событий: {stats['new_events']}, всего в базе: {stats['events_total']}, "
-        f"актуальных в {OUTPUT_FILE.name}: {stats['events_actual']}.\n"
-        f"Статистика: {STATS_FILE.relative_to(BASE)}, подробный лог: logs/parser.log"
-    )
+        stats["cost"] = llm_cost(stats["prompt_tokens"], stats["completion_tokens"])
+        append_stats(PARSER_STATS_FILE, PARSER_STATS_COLUMNS, stats)
+        log.info(summary(stats))
 
 
 if __name__ == "__main__":
